@@ -3,34 +3,38 @@ import sys
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
 import glob
 from tqdm import tqdm
 import random
+from collections import Counter
+from pathlib import Path
 
-# Import directly
+# Import your model (keep same API you used before)
 from model import GlaucomaModel
 
-# Set random seed for reproducibility
+# -----------------------
+# Repro & config
+# -----------------------
 torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
 
-# Define constants
 BATCH_SIZE = 16
 NUM_EPOCHS = 15
 LEARNING_RATE = 0.001
-NUM_CLASSES = 4
 IMAGE_SIZE = 224
 OUTPUT_DIR = "model/output"
 MODEL_NAME = "efficientnet_b0"
+RAW_ROOT = Path("data") / "raw"
 
-# Create output directory if it doesn't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Define image transformations
+# -----------------------
+# Transforms
+# -----------------------
 train_transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     transforms.RandomHorizontalFlip(),
@@ -47,325 +51,286 @@ val_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
+# -----------------------
+# Helper: infer label from path
+# -----------------------
+# Heuristics: check path components for these keywords
+LABEL_KEYWORDS = {
+    "glaucoma": ["glaucoma", "g", "glaucoma_positive", "glaucoma-pos", "glaucoma_pos"],
+    "normal": ["normal", "healthy", "h", "non-glaucoma", "non_glaucoma", "non-glaucomatous"],
+    "dr": ["diabetic", "dr", "diabetic_retinopathy", "diabetic-retinopathy"],
+    "pathological": ["pathological", "disease", "abnormal", "lesion", "pathology"]
+}
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+
+def infer_label_from_path(path):
+    p = str(path).lower()
+    # check exact keywords first
+    for label, keys in LABEL_KEYWORDS.items():
+        for k in keys:
+            if f"/{k}/" in f"/{p}/" or f"_{k}" in p or f"-{k}" in p or f"{k}." in p:
+                return label
+    # fallback heuristics: check folder names
+    for part in Path(path).parts:
+        part = part.lower()
+        for label, keys in LABEL_KEYWORDS.items():
+            for k in keys:
+                if k in part:
+                    return label
+    return None
+
+# -----------------------
+# Dataset discovery
+# -----------------------
+def discover_images_and_labels(root: Path):
+    print(f"Scanning for images under {root} ...")
+    image_paths = []
+    labels = []
+    for ext in IMAGE_EXTS:
+        for p in root.rglob(f"*{ext}"):
+            image_paths.append(str(p))
+            labels.append(infer_label_from_path(p))
+
+    # Filter out images with no inferred label (but keep track)
+    kept_paths = []
+    kept_labels = []
+    unlabeled = []
+    for p, l in zip(image_paths, labels):
+        if l is None:
+            unlabeled.append(p)
+        else:
+            kept_paths.append(p)
+            kept_labels.append(l)
+
+    print(f"Found {len(image_paths)} images, {len(kept_paths)} labeled, {len(unlabeled)} unlabeled (sample below)")
+    if unlabeled:
+        for s in unlabeled[:10]:
+            print("  unlabeled:", s)
+    return kept_paths, kept_labels
+
+# -----------------------
+# Build class mapping dynamically
+# -----------------------
+def build_class_mapping(labels_list):
+    unique = sorted(list(set(labels_list)))
+    mapping = {name: idx for idx, name in enumerate(unique)}
+    inv_map = {v:k for k,v in mapping.items()}
+    return mapping, inv_map
+
+# -----------------------
+# Dataset class
+# -----------------------
 class RetinalDataset(Dataset):
-    def __init__(self, image_paths, labels, transform=None):
+    def __init__(self, image_paths, labels, class_map, transform=None):
+        assert len(image_paths) == len(labels)
         self.image_paths = image_paths
-        self.labels = labels
+        # convert string labels to int
+        self.labels = [class_map[l] for l in labels]
         self.transform = transform
-        
+
     def __len__(self):
         return len(self.image_paths)
-    
+
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
+        label = self.labels[idx]
         try:
-            image = Image.open(img_path).convert('RGB')
-            if self.transform:
-                image = self.transform(image)
-            return image, self.labels[idx]
+            image = Image.open(img_path).convert("RGB")
         except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
-            # Return a placeholder image and the label
-            placeholder = torch.zeros(3, IMAGE_SIZE, IMAGE_SIZE)
-            return placeholder, self.labels[idx]
+            print(f"Warning: could not open {img_path}: {e}. Skipping by returning a black image.")
+            image = Image.new("RGB", (IMAGE_SIZE, IMAGE_SIZE), (0,0,0))
 
-def load_all_datasets():
-    """Load and combine all available datasets"""
-    print("Loading all datasets...")
-    
-    # Define class mapping
-    class_mapping = {
-        "normal": 0,
-        "h": 0,      # Normal/Healthy
-        "g": 1,      # Glaucoma
-        "dr": 2,     # Diabetic Retinopathy
-        "pathological": 3  # Other pathological conditions
-    }
-    
-    all_image_paths = []
-    all_labels = []
-    
-    # Load from 'all' dataset
-    print("Loading 'all' dataset...")
-    all_dir = os.path.join("data", "raw", "all", "images")
-    if os.path.exists(all_dir):
-        for img_path in glob.glob(os.path.join(all_dir, "*.jpg")) + glob.glob(os.path.join(all_dir, "*.JPG")):
-            filename = os.path.basename(img_path).lower()
-            for class_key in class_mapping.keys():
-                if f"_{class_key}" in filename or f"_{class_key}." in filename:
-                    all_image_paths.append(img_path)
-                    all_labels.append(class_mapping[class_key])
-                    break
-    
-    # Load from 'REFUGE2' dataset
-    print("Loading 'REFUGE2' dataset...")
-    refuge_dir = os.path.join("data", "raw", "REFUGE2")
-    if os.path.exists(refuge_dir):
-        # Assuming REFUGE2 has a structure with glaucoma and non-glaucoma folders
-        glaucoma_dir = os.path.join(refuge_dir, "glaucoma")
-        normal_dir = os.path.join(refuge_dir, "non-glaucoma")
-        
-        if os.path.exists(glaucoma_dir):
-            for img_path in glob.glob(os.path.join(glaucoma_dir, "*.jpg")) + glob.glob(os.path.join(glaucoma_dir, "*.png")):
-                all_image_paths.append(img_path)
-                all_labels.append(class_mapping["g"])  # Glaucoma
-                
-        if os.path.exists(normal_dir):
-            for img_path in glob.glob(os.path.join(normal_dir, "*.jpg")) + glob.glob(os.path.join(normal_dir, "*.png")):
-                all_image_paths.append(img_path)
-                all_labels.append(class_mapping["normal"])  # Normal
-    
-    # Load from 'PALM' dataset
-    print("Loading 'PALM' dataset...")
-    palm_dir = os.path.join("data", "raw", "PALM")
-    if os.path.exists(palm_dir):
-        # Assuming PALM has pathological images
-        for img_path in glob.glob(os.path.join(palm_dir, "**", "*.jpg"), recursive=True) + \
-                       glob.glob(os.path.join(palm_dir, "**", "*.png"), recursive=True):
-            all_image_paths.append(img_path)
-            all_labels.append(class_mapping["pathological"])  # Pathological
-    
-    # Load from 'archive' dataset
-    print("Loading 'archive' dataset...")
-    archive_dir = os.path.join("data", "raw", "archive")
-    if os.path.exists(archive_dir):
-        # Check for common structures in retinal datasets
-        for condition in ["normal", "glaucoma", "diabetic_retinopathy", "dr"]:
-            condition_dir = os.path.join(archive_dir, condition)
-            if os.path.exists(condition_dir):
-                for img_path in glob.glob(os.path.join(condition_dir, "*.jpg")) + \
-                               glob.glob(os.path.join(condition_dir, "*.png")):
-                    all_image_paths.append(img_path)
-                    
-                    if condition == "normal":
-                        all_labels.append(class_mapping["normal"])
-                    elif condition == "glaucoma":
-                        all_labels.append(class_mapping["g"])
-                    elif condition in ["diabetic_retinopathy", "dr"]:
-                        all_labels.append(class_mapping["dr"])
-    
-    # Print dataset statistics
-    print(f"Total images loaded: {len(all_image_paths)}")
-    class_counts = {}
-    for label in all_labels:
-        class_counts[label] = class_counts.get(label, 0) + 1
-    
-    class_names = ["Normal", "Glaucoma", "DR", "Pathological"]
-    print("Class distribution:")
-    for class_idx, count in class_counts.items():
-        print(f"  {class_names[class_idx]}: {count} images")
-    
-    return all_image_paths, all_labels
+        if self.transform:
+            image = self.transform(image)
+        return image, torch.tensor(label, dtype=torch.long)
 
+# -----------------------
+# Train function
+# -----------------------
 def train_model():
-    # Check for GPU availability
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Load all datasets
-    image_paths, labels = load_all_datasets()
-    
+    print("Using device:", device)
+
+    image_paths, string_labels = discover_images_and_labels(RAW_ROOT)
+    if len(image_paths) == 0:
+        raise RuntimeError(f"No labeled images discovered under {RAW_ROOT}. Check your folder structure or label keywords.")
+
+    class_map, inv_map = build_class_mapping(string_labels)
+    print("Class mapping:", class_map)
+    NUM_CLASSES = len(class_map)
+    print(f"Number of classes inferred: {NUM_CLASSES}")
+
+    # Show distribution
+    counts = Counter(string_labels)
+    print("Class distribution (string labels):")
+    for lbl, c in counts.items():
+        print(f"  {lbl}: {c}")
+
     # Create dataset splits
     dataset_size = len(image_paths)
+    indices = list(range(dataset_size))
+    random.shuffle(indices)
+
     train_size = int(0.7 * dataset_size)
     val_size = int(0.15 * dataset_size)
     test_size = dataset_size - train_size - val_size
-    
-    # Create indices for the splits
-    indices = list(range(dataset_size))
-    random.shuffle(indices)
-    
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:train_size+val_size]
-    test_indices = indices[train_size+val_size:]
-    
-    # Create datasets
-    train_dataset = RetinalDataset(
-        [image_paths[i] for i in train_indices],
-        [labels[i] for i in train_indices],
-        transform=train_transform
-    )
-    
-    val_dataset = RetinalDataset(
-        [image_paths[i] for i in val_indices],
-        [labels[i] for i in val_indices],
-        transform=val_transform
-    )
-    
-    test_dataset = RetinalDataset(
-        [image_paths[i] for i in test_indices],
-        [labels[i] for i in test_indices],
-        transform=val_transform
-    )
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
-    
-    print(f"Training: {len(train_dataset)}, Validation: {len(val_dataset)}, Test: {len(test_dataset)}")
-    
-    # Initialize model
+
+    train_idx = indices[:train_size]
+    val_idx = indices[train_size:train_size+val_size]
+    test_idx = indices[train_size+val_size:]
+
+    train_paths = [image_paths[i] for i in train_idx]
+    train_labels = [string_labels[i] for i in train_idx]
+    val_paths = [image_paths[i] for i in val_idx]
+    val_labels = [string_labels[i] for i in val_idx]
+    test_paths = [image_paths[i] for i in test_idx]
+    test_labels = [string_labels[i] for i in test_idx]
+
+    train_ds = RetinalDataset(train_paths, train_labels, class_map, transform=train_transform)
+    val_ds = RetinalDataset(val_paths, val_labels, class_map, transform=val_transform)
+    test_ds = RetinalDataset(test_paths, test_labels, class_map, transform=val_transform)
+
+    num_workers = min(8, os.cpu_count() or 0)
+    pin_memory = True if device.type == "cuda" else False
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+
+    print(f"Splits -> Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
+
+    # Initialize model: use dynamic num classes
     model = GlaucomaModel(num_classes=NUM_CLASSES, model_name=MODEL_NAME)
     model = model.to(device)
-    
-    # Define loss function and optimizer
+
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-    
-    # Training loop
+
     best_val_loss = float('inf')
-    train_losses = []
-    val_losses = []
-    train_accs = []
-    val_accs = []
-    
-    print("Starting training...")
+    train_losses, val_losses = [], []
+    train_accs, val_accs = [], []
+
     for epoch in range(NUM_EPOCHS):
-        # Training phase
         model.train()
-        train_loss = 0.0
+        running_loss = 0.0
         correct = 0
         total = 0
-        
-        train_loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        for inputs, targets in train_loop:
-            inputs, targets = inputs.to(device), targets.to(device)
-            
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]")
+        for imgs, targets in loop:
+            imgs = imgs.to(device)
+            targets = targets.to(device)
+
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(imgs)  # expect shape (N, NUM_CLASSES)
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
-            
-            train_loss += loss.item() * inputs.size(0)
-            _, predicted = outputs.max(1)
+
+            running_loss += loss.item() * imgs.size(0)
+            _, preds = outputs.max(1)
+            correct += preds.eq(targets).sum().item()
             total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
-            
-            # Update progress bar
-            train_loop.set_postfix(loss=loss.item(), acc=100.*correct/total)
-        
-        train_loss = train_loss / len(train_dataset)
-        train_acc = 100. * correct / total
-        train_losses.append(train_loss)
-        train_accs.append(train_acc)
-        
-        # Validation phase
+            loop.set_postfix(loss=loss.item(), acc=f"{100.*correct/total:.2f}%")
+
+        epoch_train_loss = running_loss / len(train_ds)
+        epoch_train_acc = 100. * correct / total
+        train_losses.append(epoch_train_loss)
+        train_accs.append(epoch_train_acc)
+
+        # Validation
         model.eval()
-        val_loss = 0.0
+        v_loss = 0.0
         correct = 0
         total = 0
-        
         with torch.no_grad():
-            val_loop = tqdm(val_loader, desc="Validation")
-            for inputs, targets in val_loop:
-                inputs, targets = inputs.to(device), targets.to(device)
-                
-                outputs = model(inputs)
+            loop = tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]")
+            for imgs, targets in loop:
+                imgs = imgs.to(device)
+                targets = targets.to(device)
+                outputs = model(imgs)
                 loss = criterion(outputs, targets)
-                
-                val_loss += loss.item() * inputs.size(0)
-                _, predicted = outputs.max(1)
+                v_loss += loss.item() * imgs.size(0)
+                _, preds = outputs.max(1)
+                correct += preds.eq(targets).sum().item()
                 total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
-                
-                # Update progress bar
-                val_loop.set_postfix(loss=loss.item(), acc=100.*correct/total)
-        
-        val_loss = val_loss / len(val_dataset)
-        val_acc = 100. * correct / total
-        val_losses.append(val_loss)
-        val_accs.append(val_acc)
-        
-        # Update learning rate
-        scheduler.step(val_loss)
-        
-        # Print epoch results
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
-        
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+                loop.set_postfix(loss=loss.item(), acc=f"{100.*correct/total:.2f}%")
+
+        epoch_val_loss = v_loss / len(val_ds)
+        epoch_val_acc = 100. * correct / total
+        val_losses.append(epoch_val_loss)
+        val_accs.append(epoch_val_acc)
+
+        scheduler.step(epoch_val_loss)
+        print(f"Epoch {epoch+1}: Train loss {epoch_train_loss:.4f}, Train acc {epoch_train_acc:.2f} | Val loss {epoch_val_loss:.4f}, Val acc {epoch_val_acc:.2f}")
+
+        # Save best
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
             torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "combined_model.pth"))
-            print(f"Model saved to {os.path.join(OUTPUT_DIR, 'combined_model.pth')}")
-    
-    # Save final model
+            print("Saved best model to", os.path.join(OUTPUT_DIR, "combined_model.pth"))
+
+    # final save
     torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "final_combined_model.pth"))
-    
-    # Save model in safetensors format for compatibility
+    print("Saved final model to", os.path.join(OUTPUT_DIR, "final_combined_model.pth"))
+
+    # optional safetensors
     try:
         import safetensors.torch
         safetensors.torch.save_file(model.state_dict(), os.path.join(OUTPUT_DIR, "combined_model.safetensors"))
-        print(f"Model saved in safetensors format to {os.path.join(OUTPUT_DIR, 'combined_model.safetensors')}")
-    except ImportError:
-        print("safetensors not available, skipping safetensors export")
-    
-    # Plot training history
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Val Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
+        print("Saved safetensors.")
+    except Exception:
+        print("safetensors not installed or failed -> skipped.")
+
+    # Plot history
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    plt.plot(train_losses, label="train")
+    plt.plot(val_losses, label="val")
+    plt.title("Loss")
     plt.legend()
-    plt.title('Training and Validation Loss')
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(train_accs, label='Train Acc')
-    plt.plot(val_accs, label='Val Acc')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
+    plt.subplot(1,2,2)
+    plt.plot(train_accs, label="train")
+    plt.plot(val_accs, label="val")
+    plt.title("Accuracy")
     plt.legend()
-    plt.title('Training and Validation Accuracy')
-    
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "combined_training_history.png"))
-    
-    # Evaluate on test set
+    plt.savefig(os.path.join(OUTPUT_DIR, "training_history.png"))
+
+    # Evaluate on test set with per-class accuracy
     model.eval()
     test_loss = 0.0
     correct = 0
     total = 0
-    
-    class_correct = [0] * NUM_CLASSES
-    class_total = [0] * NUM_CLASSES
-    
+    class_correct = [0]*NUM_CLASSES
+    class_total = [0]*NUM_CLASSES
+
     with torch.no_grad():
-        for inputs, targets in tqdm(test_loader, desc="Testing"):
-            inputs, targets = inputs.to(device), targets.to(device)
-            
-            outputs = model(inputs)
+        for imgs, targets in tqdm(test_loader, desc="Testing"):
+            imgs = imgs.to(device)
+            targets = targets.to(device)
+            outputs = model(imgs)
             loss = criterion(outputs, targets)
-            
-            test_loss += loss.item() * inputs.size(0)
-            _, predicted = outputs.max(1)
+            test_loss += loss.item() * imgs.size(0)
+            _, preds = outputs.max(1)
             total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
-            
-            # Per-class accuracy
+            correct += preds.eq(targets).sum().item()
             for i in range(targets.size(0)):
-                label = targets[i].item()
-                class_total[label] += 1
-                if predicted[i].item() == label:
-                    class_correct[label] += 1
-    
-    test_loss = test_loss / len(test_dataset)
+                l = targets[i].item()
+                class_total[l] += 1
+                if preds[i].item() == l:
+                    class_correct[l] += 1
+
+    test_loss = test_loss / len(test_ds)
     test_acc = 100. * correct / total
-    
-    print(f"\nTest Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%")
-    
-    class_names = ["Normal", "Glaucoma", "DR", "Pathological"]
-    print("Per-class accuracy:")
-    for i in range(NUM_CLASSES):
-        if class_total[i] > 0:
-            print(f"  {class_names[i]}: {100 * class_correct[i] / class_total[i]:.2f}%")
+    print(f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%")
+    inv_map = {v:k for k,v in class_map.items()}
+    for cls_idx in range(NUM_CLASSES):
+        if class_total[cls_idx] > 0:
+            print(f"  {inv_map[cls_idx]}: {100.*class_correct[cls_idx]/class_total[cls_idx]:.2f}% ({class_total[cls_idx]} samples)")
         else:
-            print(f"  {class_names[i]}: N/A (no test samples)")
+            print(f"  {inv_map[cls_idx]}: N/A (no samples)")
 
 if __name__ == "__main__":
     train_model()
