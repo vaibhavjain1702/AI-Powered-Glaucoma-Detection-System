@@ -1,5 +1,7 @@
 # AI-Powered Glaucoma Detection System
 
+> Based on the original project by Vanshit Ahuja – github.com/vanshitahujaa/glaucoma-detection
+
 A deep learning system for analyzing retinal fundus images and classifying glaucoma stages using PyTorch, FastAPI, and React.
 
 ## Overview
