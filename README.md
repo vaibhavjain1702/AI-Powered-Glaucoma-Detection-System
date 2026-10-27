@@ -173,3 +173,9 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - PyTorch and FastAPI communities
 - React and TypeScript communities# glaucoma-detection
 
+
+## Report
+
+- [B.Tech project report (PDF)](docs/BTech_Project_Report.pdf)
+- [Research paper (PDF)](docs/Research_Paper.pdf)
+- [DIP presentation (PDF)](docs/DIP_Presentation.pdf)
